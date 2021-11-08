@@ -146,7 +146,7 @@ func (item *Item) IsDeletedOrExpired() bool {
 // DiscardEarlierVersions returns whether the item was created with the
 // option to discard earlier versions of a key when multiple are available.
 func (item *Item) DiscardEarlierVersions() bool {
-	return item.meta&bitDiscardEarlierVersions > 0
+	return item.meta&BitDiscardEarlierVersions > 0
 }
 
 func (item *Item) yieldItemValue() ([]byte, func(), error) {
@@ -368,17 +368,17 @@ func (opt *IteratorOptions) pickTable(t table.TableInterface) bool {
 // that the tables are sorted in the right order.
 func (opt *IteratorOptions) pickTables(all []*table.Table) []*table.Table {
 	filterTables := func(tables []*table.Table) []*table.Table {
-		if opt.SinceTs > 0 {
-			tmp := tables[:0]
-			for _, t := range tables {
-				if t.MaxVersion() < opt.SinceTs {
-					continue
-				}
-				tmp = append(tmp, t)
-			}
-			tables = tmp
+		if opt.SinceTs == 0 {
+			return tables
 		}
-		return tables
+		out := tables[:0]
+		for _, t := range tables {
+			if t.MaxVersion() < opt.SinceTs {
+				continue
+			}
+			out = append(out, t)
+		}
+		return out
 	}
 
 	if len(opt.Prefix) == 0 {
@@ -456,7 +456,8 @@ type Iterator struct {
 	// iterators created by the stream interface
 	ThreadId int
 
-	Alloc *z.Allocator
+	latestTs uint64
+	Alloc    *z.Allocator
 }
 
 // NewIterator returns a new iterator. Depending upon the options, either only keys, or both
@@ -492,7 +493,7 @@ func (txn *Txn) NewIterator(opt IteratorOptions) *Iterator {
 	for i := 0; i < len(tables); i++ {
 		iters = append(iters, tables[i].sl.NewUniIterator(opt.Reverse))
 	}
-	iters = txn.db.lc.appendIterators(iters, &opt) // This will increment references.
+	iters = append(iters, txn.db.lc.iterators(&opt)...) // This will increment references.
 	res := &Iterator{
 		txn:    txn,
 		iitr:   table.NewMergeIterator(iters, opt.Reverse),
@@ -637,6 +638,9 @@ func (it *Iterator) parseItem() bool {
 
 	// Skip any versions which are beyond the readTs.
 	version := y.ParseTs(key)
+	if version > it.latestTs {
+		it.latestTs = version
+	}
 	// Ignore everything that is above the readTs and below or at the sinceTs.
 	if version > it.readTs || (it.opt.SinceTs > 0 && version <= it.opt.SinceTs) {
 		mi.Next()
@@ -749,9 +753,9 @@ func (it *Iterator) prefetch() {
 // Seek would seek to the provided key if present. If absent, it would seek to the next
 // smallest key greater than the provided key if iterating in the forward direction.
 // Behavior would be reversed if iterating backwards.
-func (it *Iterator) Seek(key []byte) {
+func (it *Iterator) Seek(key []byte) uint64 {
 	if it.iitr == nil {
-		return
+		return it.latestTs
 	}
 	if len(key) > 0 {
 		it.txn.addReadKey(key)
@@ -768,16 +772,19 @@ func (it *Iterator) Seek(key []byte) {
 	if len(key) == 0 {
 		it.iitr.Rewind()
 		it.prefetch()
-		return
+		return it.latestTs
 	}
 
 	if !it.opt.Reverse {
-		key = y.KeyWithTs(key, it.txn.readTs)
+		// Using maxUint64 instead of it.readTs because we want seek to return latestTs of the key.
+		// All the keys with ts > readTs will be discarded for iteration by the prefetch function.
+		key = y.KeyWithTs(key, math.MaxUint64)
 	} else {
 		key = y.KeyWithTs(key, 0)
 	}
 	it.iitr.Seek(key)
 	it.prefetch()
+	return it.latestTs
 }
 
 // Rewind would rewind the iterator cursor all the way to zero-th position, which would be the

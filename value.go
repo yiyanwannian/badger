@@ -47,7 +47,7 @@ var maxVlogFileSize uint32 = math.MaxUint32
 const (
 	bitDelete                 byte = 1 << 0 // Set if the key has been deleted.
 	bitValuePointer           byte = 1 << 1 // Set if the value is NOT stored directly next to key.
-	bitDiscardEarlierVersions byte = 1 << 2 // Set if earlier versions can be discarded.
+	BitDiscardEarlierVersions byte = 1 << 2 // Set if earlier versions can be discarded.
 	// Set if item shouldn't be discarded via compactions (used by merge operator)
 	bitMergeEntry byte = 1 << 3
 	// The MSB 2 bits are for transactions.
@@ -788,7 +788,9 @@ func estimateRequestSize(req *request) uint64 {
 
 // write is thread-unsafe by design and should not be called concurrently.
 func (vlog *valueLog) write(reqs []*request) error {
-	if vlog.db.opt.InMemory {
+	if vlog.db.opt.InMemory || vlog.db.opt.managedTxns {
+		// Don't do value log writes in managed mode.
+		// TODO: In the managed mode, don't create a value log.
 		return nil
 	}
 	// Validate writes before writing to vlog. Because, we don't want to partially write and return

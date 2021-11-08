@@ -18,6 +18,7 @@ package badger
 
 import (
 	"fmt"
+	"io/ioutil"
 	"math"
 	"math/rand"
 	"os"
@@ -39,7 +40,15 @@ func createAndOpen(db *DB, td []keyValVersion, level int) {
 		BloomFalsePositive: db.opt.BloomFalsePositive,
 		ChkMode:            options.NoVerification,
 	}
-	b := table.NewTableBuilder(opts)
+	createAndOpenWithOptions(db, td, level, &opts)
+}
+
+func createAndOpenWithOptions(db *DB, td []keyValVersion, level int, opts *table.Options) {
+	if opts == nil {
+		bopts := buildTableOptions(db)
+		opts = &bopts
+	}
+	b := table.NewTableBuilder(*opts)
 	defer b.Close()
 
 	// Add all keys and versions to the table.
@@ -48,13 +57,21 @@ func createAndOpen(db *DB, td []keyValVersion, level int) {
 		val := y.ValueStruct{Value: []byte(item.val), Meta: item.meta}
 		b.Add(key, val, 0)
 	}
-	fname := table.NewFilename(db.lc.reserveFileID(), db.opt.Dir)
-	tab, err := table.CreateTable(fname, b)
+	fileID := db.lc.reserveFileID()
+	var tab *table.Table
+	var err error
+	if db.opt.InMemory {
+		data := b.Finish()
+		tab, err = table.OpenInMemoryTable(data, fileID, opts)
+	} else {
+		fname := table.NewFilename(fileID, db.opt.Dir)
+		tab, err = table.CreateTable(fname, b)
+	}
 	if err != nil {
 		panic(err)
 	}
 	if err := db.manifest.addChanges([]*pb.ManifestChange{
-		newCreateChange(tab.ID(), level, 0, tab.CompressionType()),
+		newCreateChange(tab.ID(), level, tab.KeyID(), tab.CompressionType()),
 	}); err != nil {
 		panic(err)
 	}
@@ -707,11 +724,11 @@ func TestDiscardFirstVersion(t *testing.T) {
 
 	runBadgerTest(t, &opt, func(t *testing.T, db *DB) {
 		l0 := []keyValVersion{{"foo", "bar", 1, 0}}
-		l01 := []keyValVersion{{"foo", "bar", 2, bitDiscardEarlierVersions}}
+		l01 := []keyValVersion{{"foo", "bar", 2, BitDiscardEarlierVersions}}
 		l02 := []keyValVersion{{"foo", "bar", 3, 0}}
 		l03 := []keyValVersion{{"foo", "bar", 4, 0}}
 		l04 := []keyValVersion{{"foo", "bar", 9, 0}}
-		l05 := []keyValVersion{{"foo", "bar", 10, bitDiscardEarlierVersions}}
+		l05 := []keyValVersion{{"foo", "bar", 10, BitDiscardEarlierVersions}}
 
 		// Level 0 has all the tables.
 		createAndOpen(db, l0, 0)
@@ -742,11 +759,11 @@ func TestDiscardFirstVersion(t *testing.T) {
 		// - Version 1 is below DiscardTS and below the first "bitDiscardEarlierVersions"
 		//   marker so IT WILL BE REMOVED.
 		ExpectedKeys := []keyValVersion{
-			{"foo", "bar", 10, bitDiscardEarlierVersions},
+			{"foo", "bar", 10, BitDiscardEarlierVersions},
 			{"foo", "bar", 9, 0},
 			{"foo", "bar", 4, 0},
 			{"foo", "bar", 3, 0},
-			{"foo", "bar", 2, bitDiscardEarlierVersions}}
+			{"foo", "bar", 2, BitDiscardEarlierVersions}}
 
 		getAllAndCheck(t, db, ExpectedKeys)
 	})
@@ -1060,15 +1077,15 @@ func TestSameLevel(t *testing.T) {
 	opt.LmaxCompaction = true
 	runBadgerTest(t, &opt, func(t *testing.T, db *DB) {
 		l6 := []keyValVersion{
-			{"A", "bar", 4, bitDiscardEarlierVersions}, {"A", "bar", 3, 0},
+			{"A", "bar", 4, BitDiscardEarlierVersions}, {"A", "bar", 3, 0},
 			{"A", "bar", 2, 0}, {"Afoo", "baz", 2, 0},
 		}
 		l61 := []keyValVersion{
-			{"B", "bar", 4, bitDiscardEarlierVersions}, {"B", "bar", 3, 0},
+			{"B", "bar", 4, BitDiscardEarlierVersions}, {"B", "bar", 3, 0},
 			{"B", "bar", 2, 0}, {"Bfoo", "baz", 2, 0},
 		}
 		l62 := []keyValVersion{
-			{"C", "bar", 4, bitDiscardEarlierVersions}, {"C", "bar", 3, 0},
+			{"C", "bar", 4, BitDiscardEarlierVersions}, {"C", "bar", 3, 0},
 			{"C", "bar", 2, 0}, {"Cfoo", "baz", 2, 0},
 		}
 		createAndOpen(db, l6, 6)
@@ -1077,11 +1094,11 @@ func TestSameLevel(t *testing.T) {
 		require.NoError(t, db.lc.validate())
 
 		getAllAndCheck(t, db, []keyValVersion{
-			{"A", "bar", 4, bitDiscardEarlierVersions}, {"A", "bar", 3, 0},
+			{"A", "bar", 4, BitDiscardEarlierVersions}, {"A", "bar", 3, 0},
 			{"A", "bar", 2, 0}, {"Afoo", "baz", 2, 0},
-			{"B", "bar", 4, bitDiscardEarlierVersions}, {"B", "bar", 3, 0},
+			{"B", "bar", 4, BitDiscardEarlierVersions}, {"B", "bar", 3, 0},
 			{"B", "bar", 2, 0}, {"Bfoo", "baz", 2, 0},
-			{"C", "bar", 4, bitDiscardEarlierVersions}, {"C", "bar", 3, 0},
+			{"C", "bar", 4, BitDiscardEarlierVersions}, {"C", "bar", 3, 0},
 			{"C", "bar", 2, 0}, {"Cfoo", "baz", 2, 0},
 		})
 
@@ -1097,11 +1114,11 @@ func TestSameLevel(t *testing.T) {
 		db.SetDiscardTs(3)
 		require.NoError(t, db.lc.runCompactDef(-1, 6, cdef))
 		getAllAndCheck(t, db, []keyValVersion{
-			{"A", "bar", 4, bitDiscardEarlierVersions}, {"A", "bar", 3, 0},
+			{"A", "bar", 4, BitDiscardEarlierVersions}, {"A", "bar", 3, 0},
 			{"A", "bar", 2, 0}, {"Afoo", "baz", 2, 0},
-			{"B", "bar", 4, bitDiscardEarlierVersions}, {"B", "bar", 3, 0},
+			{"B", "bar", 4, BitDiscardEarlierVersions}, {"B", "bar", 3, 0},
 			{"B", "bar", 2, 0}, {"Bfoo", "baz", 2, 0},
-			{"C", "bar", 4, bitDiscardEarlierVersions}, {"C", "bar", 3, 0},
+			{"C", "bar", 4, BitDiscardEarlierVersions}, {"C", "bar", 3, 0},
 			{"C", "bar", 2, 0}, {"Cfoo", "baz", 2, 0},
 		})
 
@@ -1118,9 +1135,9 @@ func TestSameLevel(t *testing.T) {
 		cdef.t.baseLevel = 1
 		require.NoError(t, db.lc.runCompactDef(-1, 6, cdef))
 		getAllAndCheck(t, db, []keyValVersion{
-			{"A", "bar", 4, bitDiscardEarlierVersions}, {"Afoo", "baz", 2, 0},
-			{"B", "bar", 4, bitDiscardEarlierVersions}, {"Bfoo", "baz", 2, 0},
-			{"C", "bar", 4, bitDiscardEarlierVersions}, {"Cfoo", "baz", 2, 0}})
+			{"A", "bar", 4, BitDiscardEarlierVersions}, {"Afoo", "baz", 2, 0},
+			{"B", "bar", 4, BitDiscardEarlierVersions}, {"Bfoo", "baz", 2, 0},
+			{"C", "bar", 4, BitDiscardEarlierVersions}, {"Cfoo", "baz", 2, 0}})
 		require.NoError(t, db.lc.validate())
 	})
 }
@@ -1186,7 +1203,7 @@ func TestStaleDataCleanup(t *testing.T) {
 			for i := count; i > 0; i-- {
 				var meta byte
 				if i == 0 {
-					meta = bitDiscardEarlierVersions
+					meta = BitDiscardEarlierVersions
 				}
 				b.AddStaleKey(y.KeyWithTs(key, i), y.ValueStruct{Meta: meta, Value: val}, 0)
 			}
@@ -1219,5 +1236,87 @@ func TestStaleDataCleanup(t *testing.T) {
 
 		require.Zero(t, lh.getTotalStaleSize())
 
+	})
+}
+
+func TestStreamWithFullCopy(t *testing.T) {
+	dbopts := DefaultOptions("")
+	dbopts.managedTxns = true
+	dbopts.MaxLevels = 7
+	dbopts.NumVersionsToKeep = math.MaxInt32
+
+	encKey := make([]byte, 24)
+	_, err := rand.Read(encKey)
+	require.NoError(t, err)
+
+	test := func(db *DB, outOpts Options) {
+		l4 := []keyValVersion{{"a", "1", 3, bitDelete}, {"d", "4", 3, 0}}
+		l5 := []keyValVersion{{"b", "2", 2, 0}}
+		l6 := []keyValVersion{{"a", "1", 2, 0}, {"c", "3", 1, 0}}
+		createAndOpenWithOptions(db, l4, 4, nil)
+		createAndOpenWithOptions(db, l5, 5, nil)
+		createAndOpenWithOptions(db, l6, 6, nil)
+
+		if !outOpts.InMemory {
+			dir, err := ioutil.TempDir("", "badger-test")
+			require.NoError(t, err)
+			defer removeDir(dir)
+			outOpts.Dir = dir
+			outOpts.ValueDir = dir
+		}
+
+		require.NoError(t, db.StreamDB(outOpts))
+		out, err := Open(outOpts)
+		require.NoError(t, err)
+		defer func() {
+			require.NoError(t, out.Close())
+		}()
+		err = out.View(func(txn *Txn) error {
+			// Key "a" should not be there because we deleted it at higher version.
+			_, err := txn.Get([]byte("a"))
+			require.Error(t, err)
+			require.Equal(t, err, ErrKeyNotFound)
+			_, err = txn.Get([]byte("b"))
+			require.NoError(t, err)
+			_, err = txn.Get([]byte("c"))
+			require.NoError(t, err)
+			_, err = txn.Get([]byte("d"))
+			require.NoError(t, err)
+			return nil
+		})
+		require.NoError(t, err)
+	}
+	t.Run("without encryption", func(t *testing.T) {
+		opts := dbopts
+		runBadgerTest(t, &opts, func(t *testing.T, db *DB) {
+			test(db, opts)
+		})
+	})
+	t.Run("with encryption", func(t *testing.T) {
+		opts := dbopts
+		opts.IndexCacheSize = 1 << 20
+		opts.BlockCacheSize = 1 << 20
+		// Set it to zero so that we have more than one data keys.
+		opts.EncryptionKey = encKey
+		opts.EncryptionKeyRotationDuration = 0
+		runBadgerTest(t, &opts, func(t *testing.T, db *DB) {
+			test(db, opts)
+			require.Greater(t, len(db.registry.dataKeys), 1)
+		})
+	})
+	t.Run("stream from in-memory to persistent", func(t *testing.T) {
+		opts := dbopts
+		opts.IndexCacheSize = 1 << 20
+		opts.BlockCacheSize = 1 << 20
+		opts.InMemory = true
+		// Set it to zero so that we have more than one data keys.
+		opts.EncryptionKey = encKey
+		opts.EncryptionKeyRotationDuration = 0
+		runBadgerTest(t, &opts, func(t *testing.T, db *DB) {
+			outOpts := opts
+			outOpts.InMemory = false
+			test(db, outOpts)
+			require.Greater(t, len(db.registry.dataKeys), 1)
+		})
 	})
 }

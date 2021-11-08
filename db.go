@@ -758,16 +758,11 @@ var requestPool = sync.Pool{
 }
 
 func (db *DB) writeToLSM(b *request) error {
-	// We should check the length of b.Prts and b.Entries only when badger is not
-	// running in InMemory mode. In InMemory mode, we don't write anything to the
-	// value log and that's why the length of b.Ptrs will always be zero.
-	if !db.opt.InMemory && len(b.Ptrs) != len(b.Entries) {
-		return errors.Errorf("Ptrs and Entries don't match: %+v", b)
-	}
-
+	db.lock.RLock()
+	defer db.lock.RUnlock()
 	for i, entry := range b.Entries {
 		var err error
-		if entry.skipVlogAndSetThreshold(db.valueThreshold()) {
+		if db.opt.managedTxns || entry.skipVlogAndSetThreshold(db.valueThreshold()) {
 			// Will include deletion / tombstone case.
 			err = db.mt.Put(entry.Key,
 				y.ValueStruct{
@@ -829,6 +824,7 @@ func (db *DB) writeRequests(reqs []*request) error {
 		}
 		count += len(b.Entries)
 		var i uint64
+		var err error
 		for err = db.ensureRoomForWrite(); err == errNoRoom; err = db.ensureRoomForWrite() {
 			i++
 			if i%100 == 0 {
@@ -1005,16 +1001,82 @@ func (db *DB) ensureRoomForWrite() error {
 	}
 }
 
+func (db *DB) HandoverSkiplist(skl *skl.Skiplist, callback func()) error {
+	if !db.opt.managedTxns {
+		panic("Handover Skiplist is only available in managed mode.")
+	}
+	db.lock.Lock()
+	defer db.lock.Unlock()
+
+	// If we have some data in db.mt, we should push that first, so the ordering of writes is
+	// maintained.
+	if !db.mt.sl.Empty() {
+		sz := db.mt.sl.MemSize()
+		db.opt.Infof("Handover found %d B data in current memtable. Pushing to flushChan.", sz)
+		var err error
+		select {
+		case db.flushChan <- flushTask{mt: db.mt}:
+			db.imm = append(db.imm, db.mt)
+			db.mt, err = db.newMemTable()
+			if err != nil {
+				return y.Wrapf(err, "cannot push current memtable")
+			}
+		default:
+			return errNoRoom
+		}
+	}
+
+	mt := &memTable{sl: skl}
+
+	// Iterate over the skiplist and send the entries to the publisher.
+	it := skl.NewIterator()
+
+	var entries []*Entry
+	for it.SeekToFirst(); it.Valid(); it.Next() {
+		v := it.Value()
+		e := &Entry{
+			Key:       it.Key(),
+			Value:     v.Value,
+			ExpiresAt: v.ExpiresAt,
+			UserMeta:  v.UserMeta,
+		}
+		entries = append(entries, e)
+	}
+	req := &request{
+		Entries: entries,
+	}
+	reqs := []*request{req}
+	db.pub.sendUpdates(reqs)
+
+	select {
+	case db.flushChan <- flushTask{mt: mt, cb: callback}:
+		db.imm = append(db.imm, mt)
+		return nil
+	default:
+		return errNoRoom
+	}
+}
+
 func arenaSize(opt Options) int64 {
 	return opt.MemTableSize + opt.maxBatchSize + opt.maxBatchCount*int64(skl.MaxNodeSize)
 }
 
+func (db *DB) NewSkiplist() *skl.Skiplist {
+	return skl.NewSkiplist(arenaSize(db.opt))
+}
+
 // buildL0Table builds a new table from the memtable.
 func buildL0Table(ft flushTask, bopts table.Options) *table.Builder {
-	iter := ft.mt.sl.NewIterator()
+	var iter y.Iterator
+	if ft.itr != nil {
+		iter = ft.itr
+	} else {
+		iter = ft.mt.sl.NewUniIterator(false)
+	}
 	defer iter.Close()
+
 	b := table.NewTableBuilder(bopts)
-	for iter.SeekToFirst(); iter.Valid(); iter.Next() {
+	for iter.Rewind(); iter.Valid(); iter.Next() {
 		if len(ft.dropPrefixes) > 0 && hasAnyPrefixes(iter.Key(), ft.dropPrefixes) {
 			continue
 		}
@@ -1030,16 +1092,14 @@ func buildL0Table(ft flushTask, bopts table.Options) *table.Builder {
 
 type flushTask struct {
 	mt           *memTable
+	cb           func()
+	itr          y.Iterator
 	dropPrefixes [][]byte
 }
 
 // handleFlushTask must be run serially.
 func (db *DB) handleFlushTask(ft flushTask) error {
-	// There can be a scenario, when empty memtable is flushed.
-	if ft.mt.sl.Empty() {
-		return nil
-	}
-
+	// ft.mt could be nil with ft.itr being the valid field.
 	bopts := buildTableOptions(db)
 	builder := buildL0Table(ft, bopts)
 	defer builder.Close()
@@ -1075,11 +1135,52 @@ func (db *DB) handleFlushTask(ft flushTask) error {
 func (db *DB) flushMemtable(lc *z.Closer) error {
 	defer lc.Done()
 
+	var sz int64
+	var itrs []y.Iterator
+	var mts []*memTable
+	var cbs []func()
+	slurp := func() {
+		for {
+			select {
+			case more := <-db.flushChan:
+				if more.mt == nil {
+					return
+				}
+				sl := more.mt.sl
+				itrs = append(itrs, sl.NewUniIterator(false))
+				mts = append(mts, more.mt)
+				cbs = append(cbs, more.cb)
+
+				sz += sl.MemSize()
+				if sz > db.opt.MemTableSize {
+					return
+				}
+			default:
+				return
+			}
+		}
+	}
+
 	for ft := range db.flushChan {
 		if ft.mt == nil {
 			// We close db.flushChan now, instead of sending a nil ft.mt.
 			continue
 		}
+		sz = ft.mt.sl.MemSize()
+		// Reset of itrs, mts etc. is being done below.
+		y.AssertTrue(len(itrs) == 0 && len(mts) == 0 && len(cbs) == 0)
+		itrs = append(itrs, ft.mt.sl.NewUniIterator(false))
+		mts = append(mts, ft.mt)
+		cbs = append(cbs, ft.cb)
+
+		// Pick more memtables, so we can really fill up the L0 table.
+		slurp()
+
+		// db.opt.Infof("Picked %d memtables. Size: %d\n", len(itrs), sz)
+		ft.mt = nil
+		ft.itr = table.NewMergeIterator(itrs, false)
+		ft.cb = nil
+
 		for {
 			err := db.handleFlushTask(ft)
 			if err == nil {
@@ -1090,17 +1191,26 @@ func (db *DB) flushMemtable(lc *z.Closer) error {
 				// which would arrive here would match db.imm[0], because we acquire a
 				// lock over DB when pushing to flushChan.
 				// TODO: This logic is dirty AF. Any change and this could easily break.
-				y.AssertTrue(ft.mt == db.imm[0])
-				db.imm = db.imm[1:]
-				ft.mt.DecrRef() // Return memory.
+				for _, mt := range mts {
+					y.AssertTrue(mt == db.imm[0])
+					db.imm = db.imm[1:]
+					mt.DecrRef() // Return memory.
+				}
 				db.lock.Unlock()
 
+				for _, cb := range cbs {
+					if cb != nil {
+						cb()
+					}
+				}
 				break
 			}
 			// Encountered error. Retry indefinitely.
 			db.opt.Errorf("Failure while flushing memtable to disk: %v. Retrying...\n", err)
 			time.Sleep(time.Second)
 		}
+		// Reset everything.
+		itrs, mts, cbs, sz = itrs[:0], mts[:0], cbs[:0], 0
 	}
 	return nil
 }
@@ -1631,7 +1741,7 @@ func (db *DB) prepareToDrop() (func(), error) {
 	// write it to db. Then, flush all the pending flushtask. So that, we
 	// don't miss any entries.
 	if err := db.blockWrite(); err != nil {
-		return nil, err
+		return func() {}, err
 	}
 	reqs := make([]*request, 0, 10)
 	for {
@@ -1718,6 +1828,122 @@ func (db *DB) dropAll() (func(), error) {
 	return resume, nil
 }
 
+// DropPrefixNonBlocking would logically drop all the keys with the provided prefix. The data would
+// not be cleared from LSM tree immediately. It would be deleted eventually through compactions.
+// This operation is useful when we don't want to block writes while we delete the prefixes.
+// It does this in the following way:
+// - Stream the given prefixes at a given ts.
+// - Write them to skiplist at the specified ts and handover that skiplist to DB.
+func (db *DB) DropPrefixNonBlocking(prefixes ...[]byte) error {
+	if db.opt.ReadOnly {
+		return errors.New("Attempting to drop data in read-only mode.")
+	}
+
+	if len(prefixes) == 0 {
+		return nil
+	}
+	db.opt.Infof("Non-blocking DropPrefix called for %s", prefixes)
+
+	cbuf := z.NewBuffer(int(db.opt.MemTableSize), "DropPrefixNonBlocking")
+	defer cbuf.Release()
+
+	var wg sync.WaitGroup
+	handover := func(force bool) error {
+		if !force && int64(cbuf.LenNoPadding()) < db.opt.MemTableSize {
+			return nil
+		}
+
+		// Sort the kvs, add them to the builder, and hand it over to DB.
+		cbuf.SortSlice(func(left, right []byte) bool {
+			return y.CompareKeys(left, right) < 0
+		})
+
+		b := skl.NewBuilder(db.opt.MemTableSize)
+		err := cbuf.SliceIterate(func(s []byte) error {
+			b.Add(s, y.ValueStruct{Meta: bitDelete})
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		cbuf.Reset()
+		wg.Add(1)
+		return db.HandoverSkiplist(b.Skiplist(), wg.Done)
+	}
+
+	dropPrefix := func(prefix []byte) error {
+		stream := db.NewStreamAt(math.MaxUint64)
+		stream.LogPrefix = fmt.Sprintf("Dropping prefix: %#x", prefix)
+		stream.Prefix = prefix
+		// We don't need anything except key and version.
+		stream.KeyToList = func(key []byte, itr *Iterator) (*pb.KVList, error) {
+			if !itr.Valid() {
+				return nil, nil
+			}
+			item := itr.Item()
+			if item.IsDeletedOrExpired() {
+				return nil, nil
+			}
+			if !bytes.Equal(key, item.Key()) {
+				// Return on the encounter with another key.
+				return nil, nil
+			}
+
+			a := itr.Alloc
+			ka := a.Copy(key)
+			list := &pb.KVList{}
+			// We need to generate only a single delete marker per key. All the versions for this
+			// key will be considered deleted, if we delete the one at highest version.
+			kv := y.NewKV(a)
+			kv.Key = y.KeyWithTs(ka, item.Version())
+			list.Kv = append(list.Kv, kv)
+			itr.Next()
+			return list, nil
+		}
+
+		stream.Send = func(buf *z.Buffer) error {
+			kv := pb.KV{}
+			err := buf.SliceIterate(func(s []byte) error {
+				kv.Reset()
+				if err := kv.Unmarshal(s); err != nil {
+					return err
+				}
+				cbuf.WriteSlice(kv.Key)
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+			return handover(false)
+		}
+		if err := stream.Orchestrate(context.Background()); err != nil {
+			return err
+		}
+		// Flush the remaining skiplists if any.
+		return handover(true)
+	}
+
+	// Iterate over all the prefixes and logically drop them.
+	for _, prefix := range prefixes {
+		if err := dropPrefix(prefix); err != nil {
+			return errors.Wrapf(err, "While dropping prefix: %#x", prefix)
+		}
+	}
+
+	wg.Wait()
+	return nil
+}
+
+// DropPrefix would drop all the keys with the provided prefix. Based on DB options, it either drops
+// the prefixes by blocking the writes or doing a logical drop.
+// See DropPrefixBlocking and DropPrefixNonBlocking for more information.
+func (db *DB) DropPrefix(prefixes ...[]byte) error {
+	if db.opt.AllowStopTheWorld {
+		return db.DropPrefixBlocking(prefixes...)
+	}
+	return db.DropPrefixNonBlocking(prefixes...)
+}
+
 // DropPrefix would drop all the keys with the provided prefix. It does this in the following way:
 // - Stop accepting new writes.
 // - Stop memtable flushes before acquiring lock. Because we're acquring lock here
@@ -1729,7 +1955,7 @@ func (db *DB) dropAll() (func(), error) {
 // - Compact L0->L1, skipping over Kp.
 // - Compact rest of the levels, Li->Li, picking tables which have Kp.
 // - Resume memtable flushes, compactions and writes.
-func (db *DB) DropPrefix(prefixes ...[]byte) error {
+func (db *DB) DropPrefixBlocking(prefixes ...[]byte) error {
 	if len(prefixes) == 0 {
 		return nil
 	}
@@ -1974,6 +2200,7 @@ func (db *DB) StreamDB(outOptions Options) error {
 	// Stream contents of DB to the output DB.
 	stream := db.NewStreamAt(math.MaxUint64)
 	stream.LogPrefix = fmt.Sprintf("Streaming DB to new DB at %s", outDir)
+	stream.FullCopy = true
 
 	stream.Send = func(buf *z.Buffer) error {
 		return writer.Write(buf)

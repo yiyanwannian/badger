@@ -24,7 +24,9 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"testing"
+	"time"
 
 	otrace "go.opencensus.io/trace"
 
@@ -102,7 +104,7 @@ func TestManifestMagic(t *testing.T) {
 }
 
 func TestManifestVersion(t *testing.T) {
-	helpTestManifestFileCorruption(t, 4, "unsupported version")
+	helpTestManifestFileCorruption(t, 6, "unsupported version")
 }
 
 func TestManifestChecksum(t *testing.T) {
@@ -137,7 +139,7 @@ func buildTable(t *testing.T, keyValues [][]string, bopts table.Options) *table.
 	defer b.Close()
 	// TODO: Add test for file garbage collection here. No files should be left after the tests here.
 
-	filename := fmt.Sprintf("%s%s%d.sst", os.TempDir(), string(os.PathSeparator), rand.Int63())
+	filename := fmt.Sprintf("%s%s%d.sst", os.TempDir(), string(os.PathSeparator), rand.Uint32())
 
 	sort.Slice(keyValues, func(i, j int) bool {
 		return keyValues[i][0] < keyValues[j][0]
@@ -213,7 +215,7 @@ func TestManifestRewrite(t *testing.T) {
 	require.NoError(t, err)
 	defer removeDir(dir)
 	deletionsThreshold := 10
-	mf, m, err := helpOpenOrCreateManifestFile(dir, false, deletionsThreshold)
+	mf, m, err := helpOpenOrCreateManifestFile(dir, false, 0, deletionsThreshold)
 	defer func() {
 		if mf != nil {
 			mf.close()
@@ -239,9 +241,50 @@ func TestManifestRewrite(t *testing.T) {
 	err = mf.close()
 	require.NoError(t, err)
 	mf = nil
-	mf, m, err = helpOpenOrCreateManifestFile(dir, false, deletionsThreshold)
+	mf, m, err = helpOpenOrCreateManifestFile(dir, false, 0, deletionsThreshold)
 	require.NoError(t, err)
 	require.Equal(t, map[uint64]TableManifest{
 		uint64(deletionsThreshold * 3): {Level: 0},
 	}, m.Tables)
+}
+
+func TestConcurrentManifestCompaction(t *testing.T) {
+	dir, err := ioutil.TempDir("", "badger-test")
+	require.NoError(t, err)
+	defer removeDir(dir)
+
+	// set this low so rewrites will happen more often
+	deletionsThreshold := 1
+
+	// overwrite the sync function to make this race condition easily reproducible
+	syncFunc = func(f *os.File) error {
+		// effectively making the Sync() take around 1s makes this reproduce every time
+		time.Sleep(1 * time.Second)
+		return f.Sync()
+	}
+
+	mf, _, err := helpOpenOrCreateManifestFile(dir, false, 0, deletionsThreshold)
+	require.NoError(t, err)
+
+	cs := &pb.ManifestChangeSet{}
+	for i := uint64(0); i < 1000; i++ {
+		cs.Changes = append(cs.Changes,
+			newCreateChange(i, 0, 0, 0),
+			newDeleteChange(i),
+		)
+	}
+
+	// simulate 2 concurrent compaction threads
+	n := 2
+	wg := sync.WaitGroup{}
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			require.NoError(t, mf.addChanges(cs.Changes))
+		}()
+	}
+	wg.Wait()
+
+	require.NoError(t, mf.close())
 }

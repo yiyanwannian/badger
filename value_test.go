@@ -136,6 +136,8 @@ func TestValueBasic(t *testing.T) {
 }
 
 func TestValueGCManaged(t *testing.T) {
+	t.Skipf("Value Log is not used in managed mode.")
+
 	dir, err := ioutil.TempDir("", "badger-test")
 	require.NoError(t, err)
 	defer removeDir(dir)
@@ -963,8 +965,9 @@ func BenchmarkReadWrite(b *testing.B) {
 				dir, err := ioutil.TempDir("", "vlog-benchmark")
 				y.Check(err)
 				defer removeDir(dir)
-
-				db, err := Open(getTestOptions(dir))
+				opts := getTestOptions(dir)
+				opts.ValueThreshold = 0
+				db, err := Open(opts)
 				y.Check(err)
 
 				vl := &db.vlog
