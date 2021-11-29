@@ -28,9 +28,9 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/dgraph-io/badger/v3/options"
-	"github.com/dgraph-io/badger/v3/pb"
-	"github.com/dgraph-io/badger/v3/y"
+	"github.com/yiyanwannian/badger/v3/options"
+	"github.com/yiyanwannian/badger/v3/pb"
+	"github.com/yiyanwannian/badger/v3/y"
 	"github.com/golang/protobuf/proto"
 	"github.com/pkg/errors"
 )

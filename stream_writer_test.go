@@ -28,8 +28,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/dgraph-io/badger/v3/pb"
-	"github.com/dgraph-io/badger/v3/y"
+	"github.com/yiyanwannian/badger/v3/pb"
+	"github.com/yiyanwannian/badger/v3/y"
 	"github.com/dgraph-io/ristretto/z"
 )
 

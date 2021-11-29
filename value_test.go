@@ -28,7 +28,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dgraph-io/badger/v3/y"
+	"github.com/yiyanwannian/badger/v3/y"
 	humanize "github.com/dustin/go-humanize"
 	"github.com/stretchr/testify/require"
 )

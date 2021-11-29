@@ -30,7 +30,7 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/dgraph-io/badger/v3/pb"
+	"github.com/yiyanwannian/badger/v3/pb"
 	"github.com/dgraph-io/ristretto/z"
 	"github.com/pkg/errors"
 )

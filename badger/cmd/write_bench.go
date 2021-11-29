@@ -32,10 +32,10 @@ import (
 	humanize "github.com/dustin/go-humanize"
 	"github.com/spf13/cobra"
 
-	"github.com/dgraph-io/badger/v3"
-	"github.com/dgraph-io/badger/v3/options"
-	"github.com/dgraph-io/badger/v3/pb"
-	"github.com/dgraph-io/badger/v3/y"
+	"github.com/yiyanwannian/badger/v3"
+	"github.com/yiyanwannian/badger/v3/options"
+	"github.com/yiyanwannian/badger/v3/pb"
+	"github.com/yiyanwannian/badger/v3/y"
 	"github.com/dgraph-io/ristretto/z"
 )
 

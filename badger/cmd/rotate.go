@@ -21,7 +21,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/dgraph-io/badger/v3"
+	"github.com/yiyanwannian/badger/v3"
 
 	"github.com/spf13/cobra"
 )
